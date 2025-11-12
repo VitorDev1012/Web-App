@@ -1,0 +1,878 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gerenciador de Filas PWA</title>
+    <!-- Carregando Tailwind CSS para estilização responsiva e rápida -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Define a fonte e alguns estilos globais */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .tv-display {
+            /* Estilo específico para a tela de TV */
+            min-height: 100vh;
+            background: linear-gradient(135deg, #1f2937 0%, #0f172a 100%);
+            color: white;
+        }
+        .tv-number {
+            font-size: 15rem; /* Número grande para TV */
+            line-height: 1;
+            font-weight: 900;
+            text-shadow: 0 10px 20px rgba(0,0,0,0.5);
+        }
+        .pwa-container {
+            min-height: 100vh;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 1rem;
+            background-color: #f8fafc;
+        }
+        .card {
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Animação de notificação (simulação de push) */
+        @keyframes notify-in {
+            from { transform: translateY(-100%); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        .notification-bar {
+            animation: notify-in 0.5s ease-out forwards;
+            position: fixed;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 50;
+        }
+    </style>
+    <!-- Adicionando a biblioteca de QR Code -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+<body>
+
+    <!-- Estrutura Principal para a Aplicação -->
+    <div id="app" class="flex flex-col min-h-screen">
+        <!-- Barra de Notificação (Simulação de Push) -->
+        <div id="notification-area" class="fixed top-0 left-0 w-full flex justify-center p-4 z-50 pointer-events-none">
+            <!-- A notificação aparecerá aqui -->
+        </div>
+
+        <!-- Cabeçalho Global para alternar vistas (apenas para demonstração/uso do painel) -->
+        <header class="bg-white shadow-lg p-3 sticky top-0 z-40">
+            <div class="max-w-7xl mx-auto flex justify-between items-center">
+                <h1 class="text-xl font-bold text-gray-800">QueueFlow PWA</h1>
+                <select id="view-selector" class="p-2 border rounded-lg bg-gray-50 text-sm">
+                    <option value="qr">1. QR Code</option>
+                    <option value="mobile">2. PWA Mobile (Cliente)</option>
+                    <option value="tv">3. Display TV</option>
+                    <option value="admin">4. Painel de Atendimento</option>
+                </select>
+            </div>
+        </header>
+
+        <!-- Container de Conteúdo Dinâmico -->
+        <main id="content-container" class="flex-grow">
+            <!-- As vistas (QR, Mobile, TV, Admin) serão injetadas aqui -->
+        </main>
+    </div>
+
+    <!-- Firebase Imports (Firestore, Auth) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, collection, query, orderBy, onSnapshot, runTransaction, getDoc, updateDoc, where, limit } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Variáveis globais fornecidas pelo ambiente Canvas
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-queue-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Configuração do Firebase
+        let app, db, auth;
+        let userId = null;
+        let isAuthReady = false;
+        
+        // Define o nível de log do Firestore para Debug (opcional, mas útil)
+        setLogLevel('debug');
+
+        // Referências Firestore para dados públicos
+        const PUBLIC_ROOT = `/artifacts/${appId}/public/data`;
+        const Q_COL = `${PUBLIC_ROOT}/queue_items`;
+        const STATS_DOC = `${PUBLIC_ROOT}/queue_stats/current`;
+
+        // Estado Global da Aplicação
+        const state = {
+            queue: [], // Fila completa de clientes
+            currentlyServing: 0, // Número atualmente em atendimento
+            avgTimeMs: 0, // Tempo médio de atendimento em ms
+            totalServed: 0,
+            userTicket: null, // Número do ticket do usuário atual
+            userName: null,
+            view: 'qr',
+            isController: false, // Indica se a visão é o Painel de Atendimento
+        };
+
+        /**********************************************
+         * MÓDULO 1: UTILITÁRIOS E GERENCIAMENTO DE ESTADO
+         **********************************************/
+
+        /**
+         * Formata milissegundos para minutos e segundos.
+         * @param {number} ms - Tempo em milissegundos.
+         * @returns {string} Tempo formatado (ex: "5 min 30 seg").
+         */
+        function formatTime(ms) {
+            if (ms < 0) return "calculando...";
+            const totalSeconds = Math.round(ms / 1000);
+            const minutes = Math.floor(totalSeconds / 60);
+            const seconds = totalSeconds % 60;
+            return `${minutes} min ${seconds} seg`;
+        }
+        
+        /**
+         * Simula uma notificação push na tela (não é uma notificação nativa de OS).
+         * @param {string} message - Mensagem para exibir.
+         * @param {string} type - Tipo (success, error, warning).
+         */
+        function showNotification(message, type = 'success') {
+            const area = document.getElementById('notification-area');
+            const colorClass = {
+                success: 'bg-green-500',
+                error: 'bg-red-500',
+                warning: 'bg-yellow-500'
+            }[type] || 'bg-blue-500';
+
+            const notificationHtml = `
+                <div class="notification-bar p-3 mt-4 rounded-lg shadow-xl text-white ${colorClass} pointer-events-auto">
+                    ${message}
+                </div>
+            `;
+            
+            // Remove qualquer notificação existente
+            area.innerHTML = '';
+            area.insertAdjacentHTML('beforeend', notificationHtml);
+
+            // Remove a notificação após 5 segundos
+            setTimeout(() => {
+                const bar = area.querySelector('.notification-bar');
+                if (bar) {
+                    bar.style.opacity = '0';
+                    bar.style.transform = 'translateY(-100%)';
+                    setTimeout(() => bar.remove(), 500); // Espera a transição terminar
+                }
+            }, 5000);
+        }
+
+        /**********************************************
+         * MÓDULO 2: FIREBASE E SINCRONIZAÇÃO
+         **********************************************/
+
+        /**
+         * Inicializa o Firebase e realiza a autenticação.
+         */
+        async function initializeFirebase() {
+            try {
+                if (Object.keys(firebaseConfig).length === 0) {
+                    console.error("Configuração do Firebase ausente.");
+                    return;
+                }
+
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // Trata a autenticação inicial com o token customizado ou anonimamente
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                    } else {
+                        // Se não houver usuário logado, tenta entrar anonimamente
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                        userId = auth.currentUser.uid;
+                    }
+
+                    // Define o estado como pronto e inicia a sincronização
+                    isAuthReady = true;
+                    console.log("Firebase Auth Pronto. Usuário ID:", userId);
+                    startRealtimeListeners();
+                    renderApp();
+                });
+            } catch (error) {
+                console.error("Erro ao inicializar o Firebase:", error);
+                showNotification("Erro de inicialização. Verifique a chave da API e a configuração.", 'error');
+            }
+        }
+
+        /**
+         * Inicia os listeners de tempo real para fila e estatísticas.
+         */
+        function startRealtimeListeners() {
+            if (!isAuthReady) return;
+
+            // 1. Listener da Fila (Queue)
+            // Filtra apenas itens com status 'waiting' ou 'calling', ordenados por timestamp
+            const q = query(collection(db, Q_COL), where('status', 'in', ['waiting', 'calling']), orderBy('timestamp'));
+            onSnapshot(q, (snapshot) => {
+                state.queue = snapshot.docs.map(doc => ({ ...doc.data(), docId: doc.id }));
+                
+                // Tenta manter o estado do ticket do usuário após a atualização da fila
+                const storedTicket = localStorage.getItem('userTicket');
+                if (storedTicket) {
+                     // Encontra o item de fila que corresponde ao ticket/nome do usuário logado
+                     const userItem = state.queue.find(item => item.id.toString() === storedTicket);
+
+                     if (userItem) {
+                        state.userTicket = userItem.id;
+                        state.userName = userItem.name;
+                     } else {
+                         // Se o ticket não estiver mais na fila (foi finalizado), limpa o estado
+                         localStorage.removeItem('userTicket');
+                         state.userTicket = null;
+                         state.userName = null;
+                         if (state.view === 'mobile') {
+                             showNotification("Seu atendimento foi concluído! Obrigado.", 'success');
+                         }
+                     }
+                }
+                updateMobileView();
+                updateTvView();
+                updateAdminView();
+            }, (error) => {
+                console.error("Erro ao sincronizar a fila:", error);
+                showNotification("Erro na conexão em tempo real da fila.", 'error');
+            });
+
+            // 2. Listener das Estatísticas (Stats)
+            onSnapshot(doc(db, STATS_DOC), (docSnapshot) => {
+                if (docSnapshot.exists()) {
+                    const stats = docSnapshot.data();
+                    state.currentlyServing = stats.currentlyServing || 0;
+                    state.avgTimeMs = stats.avgTimePerServiceMs || 0;
+                    state.totalServed = stats.totalServedToday || 0;
+
+                    // Verifica se o número do usuário atual está sendo chamado (simulação de Notificação Push)
+                    if (state.userTicket && state.userTicket === state.currentlyServing) {
+                        showNotification(`É a sua vez! Por favor, dirija-se ao guichê. Número ${state.userTicket}.`, 'warning');
+                    }
+                    updateMobileView();
+                    updateTvView();
+                    updateAdminView();
+                } else {
+                    // Inicializa as estatísticas se não existirem
+                    setDoc(doc(db, STATS_DOC), { currentlyServing: 0, avgTimePerServiceMs: 0, totalServedToday: 0, lastServiceStartTime: new Date().getTime() }, { merge: true });
+                }
+            }, (error) => {
+                console.error("Erro ao sincronizar as estatísticas:", error);
+                showNotification("Erro na conexão em tempo real das estatísticas.", 'error');
+            });
+        }
+
+        /**********************************************
+         * MÓDULO 3: GERENCIAMENTO DE FILA
+         **********************************************/
+
+        /**
+         * Adiciona um novo cliente à fila usando uma transação para garantir
+         * que o número do ticket seja o próximo sequencial.
+         */
+        async function joinQueue(name, userId) {
+            if (!db || !isAuthReady) {
+                showNotification("Aguarde a inicialização do sistema...", 'warning');
+                return;
+            }
+
+            // Garante que o usuário não tente entrar duas vezes se o ticket ainda estiver válido
+            if (state.userTicket) {
+                showNotification(`Você já está na fila com o ticket ${state.userTicket}.`, 'warning');
+                return;
+            }
+
+            try {
+                // 1. Obtém o último ticket (simulado via Firestore - em produção, usaria um sistema de contadores)
+                const counterRef = doc(db, PUBLIC_ROOT, 'counters');
+                const nextTicket = await runTransaction(db, async (transaction) => {
+                    const counterDoc = await transaction.get(counterRef);
+                    let lastId = 0;
+                    if (counterDoc.exists()) {
+                        lastId = counterDoc.data().lastId || 0;
+                    }
+                    const newId = lastId + 1;
+                    transaction.set(counterRef, { lastId: newId }, { merge: true });
+                    return newId;
+                });
+
+                // 2. Adiciona o novo item à coleção de fila
+                await setDoc(doc(collection(db, Q_COL)), {
+                    id: nextTicket, // Número do ticket
+                    name: name,
+                    timestamp: new Date().getTime(),
+                    status: 'waiting', // waiting, calling, finished
+                    userId: userId,
+                });
+
+                state.userTicket = nextTicket;
+                state.userName = name;
+                localStorage.setItem('userTicket', nextTicket.toString());
+
+                showNotification(`Seu número é ${nextTicket}! Guarde o seu telefone.`);
+                updateMobileView();
+
+            } catch (error) {
+                console.error("Erro ao entrar na fila:", error);
+                showNotification("Erro ao entrar na fila. Tente novamente.", 'error');
+            }
+        }
+
+        /**
+         * Lógica de Painel: Chama o próximo cliente da fila.
+         */
+        async function callNext() {
+            if (!db || !isAuthReady) return;
+
+            // Encontra o próximo cliente em espera (o primeiro na fila)
+            // A ordenação é feita no onSnapshot (state.queue), então pegamos o primeiro item.
+            const nextClient = state.queue.find(item => item.status === 'waiting');
+
+            if (!nextClient) {
+                showNotification("Fila vazia. Não há clientes para chamar.", 'warning');
+                return;
+            }
+
+            try {
+                const nextNumber = nextClient.id;
+
+                // 1. Atualiza o status do cliente para 'calling'
+                await updateDoc(doc(db, Q_COL, nextClient.docId), { status: 'calling' });
+
+                // 2. Atualiza o número atualmente em atendimento e estatísticas
+                await runTransaction(db, async (transaction) => {
+                    const statsRef = doc(db, STATS_DOC);
+                    const statsDoc = await transaction.get(statsRef);
+                    const now = new Date().getTime();
+                    
+                    if (statsDoc.exists()) {
+                        const stats = statsDoc.data();
+                        
+                        // Calcule o tempo médio (simplificado: assume que o último atendimento acabou de ser finalizado)
+                        // A lógica de tempo médio mais precisa deveria ser em 'finishService'
+                        
+                        transaction.update(statsRef, {
+                            currentlyServing: nextNumber,
+                            lastServiceStartTime: now,
+                        });
+                    }
+                });
+
+                showNotification(`Chamando o número ${nextNumber}.`, 'success');
+
+            } catch (error) {
+                console.error("Erro ao chamar o próximo:", error);
+                showNotification("Erro ao chamar o próximo cliente.", 'error');
+            }
+        }
+
+        /**
+         * Lógica de Painel: Finaliza o atendimento do cliente atual.
+         */
+        async function finishService() {
+            if (!db || !isAuthReady || state.currentlyServing === 0) {
+                showNotification("Nenhum número em atendimento para finalizar.", 'warning');
+                return;
+            }
+
+            try {
+                // 1. Encontra o documento do cliente atualmente em atendimento
+                const currentClientDoc = state.queue.find(item => item.id === state.currentlyServing);
+
+                if (!currentClientDoc) {
+                    showNotification("Cliente em atendimento não encontrado na fila ativa.", 'error');
+                    return;
+                }
+                
+                // 2. Atualiza o status do cliente para 'finished'
+                await updateDoc(doc(db, Q_COL, currentClientDoc.docId), { status: 'finished' });
+
+                // 3. Atualiza as estatísticas e tempo médio
+                await runTransaction(db, async (transaction) => {
+                    const statsRef = doc(db, STATS_DOC);
+                    const statsDoc = await transaction.get(statsRef);
+                    const now = new Date().getTime();
+
+                    if (statsDoc.exists()) {
+                        const stats = statsDoc.data();
+                        const serviceDuration = now - stats.lastServiceStartTime;
+                        const newTotalServed = (stats.totalServedToday || 0) + 1;
+                        
+                        let newAvgTime = stats.avgTimePerServiceMs || 0;
+                        if (newTotalServed > 0) {
+                             // Cálculo da média móvel
+                            newAvgTime = ((newAvgTime * (newTotalServed - 1)) + serviceDuration) / newTotalServed;
+                        }
+
+
+                        transaction.update(statsRef, {
+                            currentlyServing: 0, // Zera para indicar que o guichê está livre
+                            avgTimePerServiceMs: newAvgTime,
+                            totalServedToday: newTotalServed,
+                        });
+                    }
+                });
+
+                showNotification(`Atendimento do número ${state.currentlyServing} finalizado.`, 'success');
+            } catch (error) {
+                console.error("Erro ao finalizar o serviço:", error);
+                showNotification("Erro ao finalizar o serviço.", 'error');
+            }
+        }
+
+        /**********************************************
+         * MÓDULO 4: RENDERIZAÇÃO E VISTAS
+         **********************************************/
+
+        /**
+         * Altera a vista da aplicação (Mobile, TV, QR, Admin).
+         */
+        function switchView(viewName) {
+            state.view = viewName;
+            
+            // Define se é o Painel de Atendimento para mostrar dados relevantes no topo
+            state.isController = (viewName === 'admin');
+
+            renderApp();
+        }
+        
+        /**
+         * Renderiza o componente da vista QR Code.
+         */
+        function renderQrView() {
+            const currentUrl = window.location.origin + window.location.pathname + '#mobile';
+            const html = `
+                <div class="pwa-container text-gray-800 flex flex-col items-center justify-center pt-10 px-4">
+                    <h2 class="text-3xl font-extrabold mb-4 text-center text-indigo-600">Entrada Rápida na Fila</h2>
+                    <p class="text-lg text-center mb-6">Escaneie o código abaixo com seu celular para entrar na fila de espera.</p>
+                    
+                    <div id="qrcode-canvas" class="p-4 bg-white rounded-xl shadow-2xl transition duration-500 hover:scale-[1.03] transform">
+                        <!-- QR Code será injetado aqui -->
+                    </div>
+
+                    <p class="mt-8 text-sm text-gray-500 text-center">URL de Entrada: <a href="${currentUrl}" class="text-indigo-500 break-all">${currentUrl}</a></p>
+                    <p class="mt-4 text-xs text-gray-400 text-center">ID da Aplicação: ${appId}</p>
+                </div>
+            `;
+            document.getElementById('content-container').innerHTML = html;
+            
+            // Inicia a geração do QR Code
+            const qrcodeDiv = document.getElementById('qrcode-canvas');
+            if (qrcodeDiv && typeof QRCode !== 'undefined') {
+                qrcodeDiv.innerHTML = ''; // Limpa o canvas anterior
+                new QRCode(qrcodeDiv, {
+                    text: currentUrl,
+                    width: 256,
+                    height: 256,
+                    colorDark: "#333333",
+                    colorLight: "#ffffff",
+                    correctLevel: QRCode.CorrectLevel.H
+                });
+            }
+        }
+
+        /**
+         * Renderiza o componente da vista PWA Mobile.
+         */
+        function renderMobileView() {
+            const html = `
+                <div class="pwa-container pt-10 pb-20">
+                    <div class="text-center mb-10">
+                        <h2 class="text-3xl font-extrabold text-gray-900">Sua Fila de Espera</h2>
+                        <p class="text-gray-500">Acompanhe seu status em tempo real.</p>
+                    </div>
+                    
+                    <!-- Area de Cadastro/Status -->
+                    <div id="mobile-status-area">
+                        <!-- Conteúdo dinâmico será injetado aqui -->
+                    </div>
+
+                    <!-- Area de Atendimentos Atuais (Visível para todos) -->
+                    <div class="mt-8 p-4 bg-white rounded-xl card">
+                        <h3 class="text-xl font-semibold mb-3 text-indigo-600">Números em Atendimento</h3>
+                        <div id="current-serving-list" class="space-y-2 text-lg font-medium text-gray-700">
+                            <!-- Números em atendimento (se houver mais de um guichê) ou o atual -->
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.getElementById('content-container').innerHTML = html;
+            updateMobileView(); // Preenche com dados iniciais
+        }
+
+        /**
+         * Atualiza o conteúdo dinâmico da vista Mobile.
+         */
+        function updateMobileView() {
+            const mobileStatusArea = document.getElementById('mobile-status-area');
+            const currentServingList = document.getElementById('current-serving-list');
+            if (!mobileStatusArea || !currentServingList) return;
+            
+            const currentServing = state.currentlyServing > 0 ? state.currentlyServing : 'Nenhum';
+            
+            // Atualiza a lista de atendimentos atuais
+            currentServingList.innerHTML = `
+                <div class="flex justify-between p-2 border-b">
+                    <span>Guichê Principal:</span>
+                    <span class="font-bold text-2xl text-red-500">${currentServing}</span>
+                </div>
+            `;
+            
+            // Lógica para Posição do Usuário
+            const userPosition = state.queue.findIndex(item => item.id === state.userTicket) + 1;
+            const waitingAhead = userPosition > 0 ? userPosition - 1 : 0;
+            
+            // Cálculo do Tempo Médio de Espera Estimado
+            const estimatedWaitTimeMs = waitingAhead * state.avgTimeMs;
+            const estimatedWaitTimeFormatted = formatTime(estimatedWaitTimeMs);
+
+            if (state.userTicket) {
+                // Vista de Status
+                const statusHtml = `
+                    <div class="bg-indigo-500 text-white p-6 rounded-xl card mb-6">
+                        <div class="flex justify-between items-center mb-4">
+                            <span class="text-sm font-light opacity-80">Seu Ticket</span>
+                            <span class="text-sm font-light opacity-80">${state.userName}</span>
+                        </div>
+                        <p class="text-6xl font-bold text-center">${state.userTicket}</p>
+                    </div>
+
+                    <div class="grid grid-cols-3 gap-3 text-center">
+                        <div class="bg-white p-4 rounded-xl card">
+                            <p class="text-4xl font-extrabold text-indigo-600">${waitingAhead}</p>
+                            <span class="text-xs font-semibold uppercase text-gray-500">Pessoas à Frente</span>
+                        </div>
+                        <div class="bg-white p-4 rounded-xl card">
+                            <p class="text-4xl font-extrabold text-indigo-600">${userPosition > 0 ? userPosition : '-'}</p>
+                            <span class="text-xs font-semibold uppercase text-gray-500">Sua Posição</span>
+                        </div>
+                        <div class="bg-white p-4 rounded-xl card">
+                            <p class="text-lg font-bold text-gray-800">${estimatedWaitTimeFormatted}</p>
+                            <span class="text-xs font-semibold uppercase text-gray-500">Tempo Estimado</span>
+                        </div>
+                    </div>
+                `;
+                mobileStatusArea.innerHTML = statusHtml;
+
+                // Destaca se o usuário estiver sendo chamado
+                const isCalling = state.currentlyServing === state.userTicket;
+                if (isCalling) {
+                    mobileStatusArea.querySelector('.bg-indigo-500').classList.add('bg-red-500', 'animate-pulse');
+                    showNotification(`ATENÇÃO! É A SUA VEZ: ${state.userTicket}`, 'error');
+                }
+
+            } else {
+                // Vista de Cadastro (Join Form)
+                const formHtml = `
+                    <form id="join-queue-form" class="bg-white p-6 rounded-xl card">
+                        <h3 class="text-2xl font-semibold mb-4 text-center text-gray-800">Entrar na Fila</h3>
+                        <div class="mb-4">
+                            <label for="client-name" class="block text-sm font-medium text-gray-700 mb-1">Nome Completo</label>
+                            <input type="text" id="client-name" name="client-name" required 
+                                class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" 
+                                placeholder="Nome e Sobrenome">
+                        </div>
+                        <button type="submit" 
+                            class="w-full bg-indigo-600 text-white p-3 rounded-lg font-semibold text-lg hover:bg-indigo-700 transition duration-150">
+                            Pegar Minha Senha
+                        </button>
+                    </form>
+                `;
+                mobileStatusArea.innerHTML = formHtml;
+                
+                // Adiciona o listener do formulário
+                document.getElementById('join-queue-form')?.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    const nameInput = document.getElementById('client-name');
+                    const name = nameInput.value.trim();
+                    if (name) {
+                        joinQueue(name, userId);
+                    }
+                });
+            }
+        }
+
+        /**
+         * Renderiza e atualiza a vista Display TV.
+         */
+        function renderTvView() {
+            const html = `
+                <div class="tv-display flex flex-col items-center justify-center p-8">
+                    <h2 class="text-4xl sm:text-6xl font-extrabold mb-6 uppercase tracking-wider text-yellow-400">AGORA ATENDENDO</h2>
+                    <div id="tv-current-number" class="w-full text-center p-8 rounded-3xl bg-indigo-800 shadow-2xl transition duration-500 hover:shadow-indigo-500/50">
+                        <span class="tv-number">000</span>
+                    </div>
+                    
+                    <div class="mt-10 w-full max-w-4xl">
+                        <h3 class="text-2xl font-semibold mb-4 border-b-2 border-gray-700 pb-2 text-gray-300">Próximos da Fila</h3>
+                        <div id="tv-next-in-queue" class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-center">
+                            <!-- Próximos números serão injetados aqui -->
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.getElementById('content-container').innerHTML = html;
+            updateTvView(); // Preenche com dados iniciais
+        }
+        
+        /**
+         * Atualiza o conteúdo dinâmico da vista TV.
+         */
+        function updateTvView() {
+            const tvNumberEl = document.querySelector('#tv-current-number .tv-number');
+            const tvNextEl = document.getElementById('tv-next-in-queue');
+            if (!tvNumberEl || !tvNextEl) return;
+
+            // 1. Número em Atendimento
+            const currentNumber = state.currentlyServing > 0 ? state.currentlyServing.toString().padStart(3, '0') : 'LIVRE';
+            tvNumberEl.textContent = currentNumber;
+            tvNumberEl.parentElement.classList.toggle('bg-red-600', state.currentlyServing !== 0);
+            tvNumberEl.parentElement.classList.toggle('bg-indigo-800', state.currentlyServing === 0);
+
+            // 2. Próximos na Fila (máximo de 4)
+            const waitingClients = state.queue.filter(item => item.status === 'waiting' || item.status === 'calling');
+            const nextClients = waitingClients.slice(0, 4);
+
+            tvNextEl.innerHTML = nextClients.map(client => `
+                <div class="p-3 rounded-lg ${client.status === 'calling' ? 'bg-yellow-500 text-gray-900 font-bold' : 'bg-gray-700 text-white'} shadow-md">
+                    <span class="text-xl font-extrabold">${client.id.toString().padStart(3, '0')}</span>
+                    <p class="text-xs truncate opacity-75">${client.name.split(' ')[0]}</p>
+                </div>
+            `).join('') || '<p class="col-span-4 text-center text-xl pt-4 text-gray-400">Fila de espera vazia.</p>';
+        }
+
+        /**
+         * Renderiza e atualiza o Painel de Atendimento (Admin).
+         */
+        function renderAdminView() {
+            const html = `
+                <div class="pwa-container pt-10 pb-20">
+                    <div class="text-center mb-10">
+                        <h2 class="text-3xl font-extrabold text-red-600">Painel de Atendimento</h2>
+                        <p class="text-gray-500">Controle de Fluxo e Estatísticas</p>
+                    </div>
+
+                    <!-- Controles -->
+                    <div class="bg-white p-6 rounded-xl card mb-8 grid grid-cols-2 gap-4">
+                        <div class="col-span-2 text-center">
+                            <p class="text-xl font-semibold mb-2 text-gray-800">Atualmente Chamando:</p>
+                            <p class="text-5xl font-extrabold text-red-600">${state.currentlyServing > 0 ? state.currentlyServing : 'LIVRE'}</p>
+                            <p class="text-sm text-gray-500 mt-1">Total Atendido Hoje: ${state.totalServed}</p>
+                        </div>
+                        <button id="call-next-btn" class="bg-green-600 text-white p-3 rounded-lg font-semibold text-lg hover:bg-green-700 transition duration-150 shadow-md disabled:bg-gray-400">
+                            Chamar Próximo
+                        </button>
+                        <button id="finish-service-btn" class="bg-indigo-600 text-white p-3 rounded-lg font-semibold text-lg hover:bg-indigo-700 transition duration-150 shadow-md disabled:bg-gray-400">
+                            Finalizar Atendimento
+                        </button>
+                    </div>
+
+                    <!-- Estatísticas -->
+                    <div class="bg-white p-6 rounded-xl card mb-8">
+                        <h3 class="text-xl font-semibold mb-4 text-indigo-600">Estatísticas de Serviço</h3>
+                        <div class="flex justify-between items-center border-b pb-2 mb-2">
+                            <span class="text-gray-600">Tempo Médio por Cliente:</span>
+                            <span class="font-bold text-gray-800">${formatTime(state.avgTimeMs)}</span>
+                        </div>
+                        <div class="flex justify-between items-center border-b pb-2 mb-2">
+                            <span class="text-gray-600">Clientes em Espera:</span>
+                            <span class="font-bold text-gray-800">${state.queue.filter(item => item.status === 'waiting').length}</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-600">Total na Fila Ativa (Espera/Chamando):</span>
+                            <span class="font-bold text-gray-800">${state.queue.length}</span>
+                        </div>
+                    </div>
+
+                    <!-- Lista da Fila -->
+                    <div class="bg-white p-6 rounded-xl card">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-800">Lista Detalhada da Fila</h3>
+                        <div id="admin-queue-list" class="space-y-3">
+                            <!-- Lista de clientes será injetada aqui -->
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.getElementById('content-container').innerHTML = html;
+            
+            // Adiciona listeners dos botões
+            document.getElementById('call-next-btn')?.addEventListener('click', callNext);
+            document.getElementById('finish-service-btn')?.addEventListener('click', finishService);
+            
+            updateAdminView(); // Preenche com dados iniciais
+        }
+
+        /**
+         * Atualiza o conteúdo dinâmico da vista Admin.
+         */
+        function updateAdminView() {
+            const adminQueueList = document.getElementById('admin-queue-list');
+            const callNextBtn = document.getElementById('call-next-btn');
+            const finishServiceBtn = document.getElementById('finish-service-btn');
+            
+            if (!adminQueueList) return;
+            
+            // Atualiza botões
+            if (callNextBtn) callNextBtn.disabled = state.queue.filter(item => item.status === 'waiting').length === 0;
+            if (finishServiceBtn) finishServiceBtn.disabled = state.currentlyServing === 0;
+
+
+            // Lista Detalhada
+            adminQueueList.innerHTML = state.queue.map(client => {
+                const badgeColor = {
+                    waiting: 'bg-indigo-100 text-indigo-800',
+                    calling: 'bg-red-100 text-red-800 font-bold animate-pulse',
+                    finished: 'bg-green-100 text-green-800'
+                }[client.status] || 'bg-gray-100 text-gray-800';
+                
+                const timeInQueue = formatTime(new Date().getTime() - client.timestamp);
+
+                return `
+                    <div class="flex justify-between items-center p-3 rounded-lg border">
+                        <div class="flex flex-col">
+                            <span class="text-lg font-bold text-gray-900">#${client.id.toString().padStart(3, '0')}</span>
+                            <span class="text-sm text-gray-600">${client.name}</span>
+                        </div>
+                        <div class="text-right">
+                            <span class="inline-block px-3 py-1 text-xs rounded-full ${badgeColor}">
+                                ${client.status.toUpperCase()}
+                            </span>
+                            <p class="text-xs text-gray-500 mt-1">Fila há: ${timeInQueue}</p>
+                        </div>
+                    </div>
+                `;
+            }).join('') || '<p class="text-center text-gray-500 italic p-4">A fila está vazia.</p>';
+        }
+
+        /**
+         * Função principal de renderização.
+         */
+        function renderApp() {
+            switch (state.view) {
+                case 'qr':
+                    renderQrView();
+                    break;
+                case 'mobile':
+                    renderMobileView();
+                    break;
+                case 'tv':
+                    renderTvView();
+                    break;
+                case 'admin':
+                    renderAdminView();
+                    break;
+                default:
+                    renderQrView();
+            }
+        }
+
+        /**********************************************
+         * MÓDULO 5: PWA E INICIALIZAÇÃO
+         **********************************************/
+
+        /**
+         * Registra o Service Worker para capacidades offline.
+         */
+        function registerServiceWorker() {
+            if ('serviceWorker' in navigator) {
+                window.addEventListener('load', () => {
+                    navigator.serviceWorker.register('/service-worker.js', { scope: '/' })
+                        .then(registration => {
+                            console.log('Service Worker registrado com sucesso:', registration.scope);
+                        })
+                        .catch(error => {
+                            console.error('Falha no registro do Service Worker:', error);
+                        });
+                });
+            }
+        }
+
+        // Listener para alternar vistas via dropdown
+        document.getElementById('view-selector')?.addEventListener('change', (e) => {
+            switchView(e.target.value);
+        });
+
+        // Inicialização:
+        // 1. Inicia o Firebase e a autenticação
+        initializeFirebase();
+        
+        // 2. Registra o Service Worker (aqui estou apenas registrando, a definição do SW estaria em service-worker.js)
+        // OBS: Como a geração de múltiplos arquivos não é permitida, este registro é apenas uma simulação
+        // do requisito. Em um ambiente real, o arquivo service-worker.js conteria a lógica de cache.
+        // registerServiceWorker(); 
+        
+        // Determina a vista inicial (Mobile se o usuário tiver um ticket salvo)
+        const initialTicket = localStorage.getItem('userTicket');
+        const initialView = initialTicket ? 'mobile' : 'qr';
+        switchView(initialView);
+
+
+        // Simulação de arquivo service-worker.js (apenas para fins de documentação)
+        // Em um ambiente real, este código estaria em um arquivo separado.
+        // Já que é apenas um arquivo, o suporte offline será limitado a caching do navegador.
+
+        /** * Conteúdo simulado do service-worker.js
+         * * const CACHE_NAME = 'queue-flow-v1';
+         * const urlsToCache = [
+         * '/',
+         * '/fila_pwa.html', // Ou a rota principal
+         * 'https://cdn.tailwindcss.com',
+         * 'https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap',
+         * 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js',
+         * 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js',
+         * 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js',
+         * 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js'
+         * ];
+         * * self.addEventListener('install', event => {
+         * event.waitUntil(
+         * caches.open(CACHE_NAME)
+         * .then(cache => {
+         * return cache.addAll(urlsToCache);
+         * })
+         * );
+         * });
+         * * self.addEventListener('fetch', event => {
+         * event.respondWith(
+         * caches.match(event.request)
+         * .then(response => {
+         * // Cache hit - return response
+         * if (response) {
+         * return response;
+         * }
+         * // Clone the request because it is a stream that can only be consumed once
+         * const fetchRequest = event.request.clone();
+         * * return fetch(fetchRequest).then(
+         * response => {
+         * // Check if we received a valid response
+         * if(!response || response.status !== 200 || response.type !== 'basic') {
+         * return response;
+         * }
+         * * // Clone the response because it is a stream that can only be consumed once
+         * const responseToCache = response.clone();
+         * * caches.open(CACHE_NAME)
+         * .then(cache => {
+         * cache.put(event.request, responseToCache);
+         * });
+         * * return response;
+         * }
+         * );
+         * })
+         * );
+         * });
+         * */
+
+    </script>
+</body>
+</html>
